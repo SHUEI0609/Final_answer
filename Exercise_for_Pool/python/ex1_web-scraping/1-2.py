@@ -1,0 +1,364 @@
+import json
+import re
+import time
+from pathlib import Path
+from urllib.parse import unquote, urljoin, urlparse
+
+import pandas as pd
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+BASE_DIR = Path(__file__).resolve().parent
+SEARCH_URL = "https://r.gnavi.co.jp/area/tokyo/rs/"
+OUTPUT_FILE = BASE_DIR / "1-2.csv"
+CHROMEDRIVER_PATH = BASE_DIR / "chromedriver"
+MAX_RECORDS = 50
+RESERVE_URLS = 10
+WAIT_SECONDS = 3
+PAGE_TIMEOUT = 30
+HEADLESS = False
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0 Safari/537.36"
+)
+
+COLUMNS = [
+    "店舗名",
+    "電話番号",
+    "メールアドレス",
+    "都道府県",
+    "市区町村",
+    "番地",
+    "建物名",
+    "URL",
+    "SSL",
+]
+
+PREFECTURE_PATTERN = r"北海道|東京都|京都府|大阪府|.{2,3}県"
+ADDRESS_PATTERN = re.compile(
+    rf"^(?P<prefecture>{PREFECTURE_PATTERN})"
+    r"(?P<municipality>.*?)"
+    r"(?P<street_number>"
+    r"[0-9]+"
+    r"(?:条(?:通|西|東|南|北)[0-9]+(?:[-‐‑‒–—―ー−ｰ][0-9]+)*)?"
+    r"(?:(?:丁目|番地?|号|[-‐‑‒–—―ー−ｰのノ])\s*[0-9]+)*"
+    r"(?:丁目|番地?|号)?"
+    r")"
+    r"(?P<building>.*)$"
+)
+
+
+def create_driver():
+    options = webdriver.ChromeOptions()
+    options.add_argument(f"--user-agent={USER_AGENT}")
+    options.add_argument("--window-size=1440,1000")
+    options.add_argument("--disable-search-engine-choice-screen")
+
+    if HEADLESS:
+        options.add_argument("--headless=new")
+
+    if CHROMEDRIVER_PATH.exists():
+        service = Service(executable_path=str(CHROMEDRIVER_PATH))
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
+
+    driver.set_page_load_timeout(PAGE_TIMEOUT)
+    return driver
+
+
+def open_after_wait(driver, url):
+    time.sleep(WAIT_SECONDS)
+    driver.get(url)
+
+
+def load_json_ld(driver):
+    items = []
+
+    for script in driver.find_elements(By.CSS_SELECTOR, 'script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.get_attribute("textContent"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if isinstance(data, list):
+            items.extend(item for item in data if isinstance(item, dict))
+        elif isinstance(data, dict):
+            items.append(data)
+
+    return items
+
+
+def extract_shop_urls(driver):
+    page_urls = []
+    shop_url_pattern = re.compile(r"^https://r\.gnavi\.co\.jp/[A-Za-z0-9_-]+/?$")
+
+    for link in driver.find_elements(By.CSS_SELECTOR, 'a[class*="titleLink"]'):
+        href = link.get_attribute("href").split("?", 1)[0]
+        if shop_url_pattern.match(href):
+            page_urls.append(href)
+
+    if page_urls:
+        return list(dict.fromkeys(page_urls))
+
+    scripts = driver.find_elements(By.CSS_SELECTOR, "script#__NEXT_DATA__")
+
+    if scripts:
+        try:
+            next_data = json.loads(scripts[0].get_attribute("textContent"))
+            restaurants = next_data["props"]["pageProps"]["data"]["restaurants"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            restaurants = []
+
+        for restaurant in restaurants:
+            shop_number = restaurant.get("urlShopNo", "")
+            if shop_number:
+                page_urls.append(urljoin(SEARCH_URL, f"/{shop_number}/"))
+
+    return list(dict.fromkeys(page_urls))
+
+
+def click_next_page(driver):
+    locator = (By.XPATH, "//img[starts-with(@alt, '次（')]/parent::a")
+    old_urls = set(extract_shop_urls(driver))
+    next_button = WebDriverWait(driver, PAGE_TIMEOUT).until(
+        EC.element_to_be_clickable(locator)
+    )
+    current_url = driver.current_url
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center'});", next_button
+    )
+    time.sleep(WAIT_SECONDS)
+    next_button.click()
+    WebDriverWait(driver, PAGE_TIMEOUT).until(EC.url_changes(current_url))
+    WebDriverWait(driver, PAGE_TIMEOUT).until(
+        lambda current_driver: set(extract_shop_urls(current_driver)) != old_urls
+    )
+
+
+def collect_shop_urls(driver):
+    target_count = MAX_RECORDS + RESERVE_URLS
+    shop_urls = []
+    page = 1
+
+    open_after_wait(driver, SEARCH_URL)
+
+    while len(shop_urls) < target_count:
+        if page > 10:
+            raise RuntimeError("10ページ以内に必要な店舗URLを取得できませんでした。")
+
+        print(f"検索結果 {page} ページ目を取得しています")
+        page_urls = extract_shop_urls(driver)
+        if not page_urls:
+            raise RuntimeError(
+                "検索結果から店舗URLを取得できませんでした。"
+                "ぐるなびのHTML構造を確認してください。"
+            )
+
+        shop_urls.extend(url for url in page_urls if url not in shop_urls)
+
+        if len(shop_urls) >= target_count:
+            break
+
+        click_next_page(driver)
+        page += 1
+
+    return shop_urls
+
+
+def find_table_value(driver, label):
+    elements = driver.find_elements(
+        By.XPATH,
+        f"//th[contains(normalize-space(.), '{label}')]/following-sibling::td[1]",
+    )
+    return elements[0] if elements else None
+
+
+def get_restaurant_data(driver):
+    for data in load_json_ld(driver):
+        if data.get("@type") == "Restaurant":
+            return data
+    return {}
+
+
+def normalize_address(address):
+    address = re.sub(r"〒?\s*[0-9０-９]{3}-?[0-9０-９]{4}", "", address)
+    address = re.sub(r"\s+", " ", address).strip()
+
+    translation_table = str.maketrans(
+        "０１２３４５６７８９－―‐",
+        "0123456789---",
+    )
+    return address.translate(translation_table)
+
+
+def split_address(address):
+    address = normalize_address(address)
+    match = ADDRESS_PATTERN.match(address)
+
+    if match:
+        return (
+            match.group("prefecture").strip(),
+            match.group("municipality").strip(),
+            match.group("street_number").strip(),
+            match.group("building").strip(),
+        )
+
+    prefecture_match = re.match(rf"^(?P<prefecture>{PREFECTURE_PATTERN})", address)
+    if prefecture_match:
+        prefecture = prefecture_match.group("prefecture")
+        municipality = address[prefecture_match.end() :].strip()
+        return prefecture, municipality, "", ""
+
+    return "", address, "", ""
+
+
+def extract_email(driver):
+    links = driver.find_elements(By.CSS_SELECTOR, 'a[href^="mailto:"]')
+    if not links:
+        return ""
+
+    href = unquote(links[0].get_attribute("href"))
+    return href.removeprefix("mailto:").split("?", 1)[0].strip()
+
+
+def extract_official_url(driver):
+    homepage_cell = find_table_value(driver, "お店のホームページ")
+    if homepage_cell is None:
+        return ""
+
+    links = homepage_cell.find_elements(By.CSS_SELECTOR, "a[data-o]")
+    if links:
+        try:
+            encoded = json.loads(links[0].get_attribute("data-o"))
+            scheme = encoded.get("b", "https")
+            destination = encoded.get("a", "")
+            if destination:
+                if destination.startswith(("http://", "https://")):
+                    return destination
+                return f"{scheme}://{destination.lstrip('/')}"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    for link in homepage_cell.find_elements(By.CSS_SELECTOR, "a[href]"):
+        href = link.get_attribute("href")
+        if href and not href.endswith("#"):
+            return href
+
+    return ""
+
+
+def resolve_official_url(driver, url):
+    if not url:
+        return "", ""
+
+    try:
+        open_after_wait(driver, url)
+        final_url = driver.current_url
+        is_secure_context = driver.execute_script("return window.isSecureContext")
+        has_ssl = urlparse(final_url).scheme == "https" and is_secure_context
+        return final_url, bool(has_ssl)
+    except WebDriverException as error:
+        print(f"  公式サイトを確認できませんでした: {error.msg.splitlines()[0]}")
+        return url, False
+
+
+def make_full_address(restaurant_data, driver):
+    address_data = restaurant_data.get("address", {})
+    if isinstance(address_data, dict):
+        address = "".join(
+            str(address_data.get(key, ""))
+            for key in ("addressRegion", "addressLocality", "streetAddress")
+        )
+        if address:
+            return address
+
+    address_cell = find_table_value(driver, "住所")
+    if address_cell is None:
+        return ""
+
+    address = address_cell.text
+    for marker in ("大きな地図で見る", "地図印刷"):
+        address = address.split(marker, 1)[0]
+    return address.strip()
+
+
+def scrape_shop(driver, shop_url):
+    open_after_wait(driver, shop_url)
+    restaurant_data = get_restaurant_data(driver)
+
+    name = str(restaurant_data.get("name", "")).strip()
+    telephone = str(restaurant_data.get("telephone", "")).strip()
+
+    if not name:
+        name_cell = find_table_value(driver, "店名")
+        name = name_cell.text.splitlines()[0].strip() if name_cell else ""
+    if not telephone:
+        phone_cell = find_table_value(driver, "電話番号")
+        phone_text = phone_cell.text if phone_cell else ""
+        phone_match = re.search(r"0\d{1,4}-\d{1,4}-\d{3,4}", phone_text)
+        telephone = phone_match.group() if phone_match else ""
+
+    full_address = make_full_address(restaurant_data, driver)
+    prefecture, municipality, street_number, building = split_address(full_address)
+    email = extract_email(driver)
+    official_url = extract_official_url(driver)
+    final_url, has_ssl = resolve_official_url(driver, official_url)
+
+    return {
+        "店舗名": name,
+        "電話番号": telephone,
+        "メールアドレス": email,
+        "都道府県": prefecture,
+        "市区町村": municipality,
+        "番地": street_number,
+        "建物名": building,
+        "URL": final_url,
+        "SSL": has_ssl,
+    }
+
+
+def main():
+    driver = create_driver()
+
+    try:
+        shop_urls = collect_shop_urls(driver)
+        records = []
+
+        for shop_url in shop_urls:
+            if len(records) >= MAX_RECORDS:
+                break
+
+            print(f"店舗 {len(records) + 1}/{MAX_RECORDS}: {shop_url}")
+            try:
+                record = scrape_shop(driver, shop_url)
+            except (TimeoutException, WebDriverException) as error:
+                message = getattr(error, "msg", str(error)).splitlines()[0]
+                print(f"  店舗ページを取得できませんでした: {message}")
+                continue
+
+            if not record["店舗名"]:
+                print("  店舗名を取得できなかったため、この店舗を除外します")
+                continue
+
+            records.append(record)
+
+        if len(records) < MAX_RECORDS:
+            raise RuntimeError(f"50件に届きませんでした。取得件数: {len(records)}件")
+
+        dataframe = pd.DataFrame(records, columns=COLUMNS)
+        dataframe.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+        print(f"{OUTPUT_FILE} に {len(dataframe)} 件保存しました")
+    finally:
+        driver.quit()
+
+
+if __name__ == "__main__":
+    main()
