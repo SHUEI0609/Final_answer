@@ -61,6 +61,7 @@ ADDRESS_PATTERN = re.compile(
     r")"
     r"(?P<building>.*)$"
 )
+FLOOR_SUFFIX_PATTERN = re.compile(r"^(?:F|[~〜～‐‑‒–—―ー−ｰ-]\s*[0-9]+\s*F)$", re.IGNORECASE)
 
 
 def get_with_delay(session, url, **kwargs):
@@ -179,11 +180,17 @@ def split_address(address):
     match = ADDRESS_PATTERN.match(address)
 
     if match:
+        street_number = match.group("street_number").strip()
+        building = match.group("building").strip()
+
+        if FLOOR_SUFFIX_PATTERN.match(building) and re.search(r"[0-9]{2}$", street_number):
+            street_number, building = street_number[:-1], street_number[-1] + building
+
         return (
             match.group("prefecture").strip(),
             match.group("municipality").strip(),
-            match.group("street_number").strip(),
-            match.group("building").strip(),
+            street_number,
+            building,
         )
 
     prefecture_match = re.match(rf"^(?P<prefecture>{PREFECTURE_PATTERN})", address)

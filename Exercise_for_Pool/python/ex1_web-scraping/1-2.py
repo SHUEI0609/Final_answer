@@ -69,6 +69,7 @@ ADDRESS_PATTERN = re.compile(
     r")"
     r"(?P<building>.*)$"
 )
+FLOOR_SUFFIX_PATTERN = re.compile(r"^(?:F|[~〜～‐‑‒–—―ー−ｰ-]\s*[0-9]+\s*F)$", re.IGNORECASE)
 
 
 def create_driver():
@@ -226,11 +227,17 @@ def split_address(address):
     match = ADDRESS_PATTERN.match(address)
 
     if match:
+        street_number = match.group("street_number").strip()
+        building = match.group("building").strip()
+
+        if FLOOR_SUFFIX_PATTERN.match(building) and re.search(r"[0-9]{2}$", street_number):
+            street_number, building = street_number[:-1], street_number[-1] + building
+
         return (
             match.group("prefecture").strip(),
             match.group("municipality").strip(),
-            match.group("street_number").strip(),
-            match.group("building").strip(),
+            street_number,
+            building,
         )
 
     prefecture_match = re.match(rf"^(?P<prefecture>{PREFECTURE_PATTERN})", address)
@@ -394,6 +401,16 @@ def main():
             except (TimeoutException, WebDriverException) as error:
                 message = getattr(error, "msg", str(error)).splitlines()[0]
                 print(f"  店舗ページを取得できませんでした: {message}")
+                lowered_message = message.lower()
+                if any(
+                    marker in lowered_message
+                    for marker in ("invalid session id", "session deleted", "chrome not reachable")
+                ):
+                    try:
+                        driver.quit()
+                    except WebDriverException:
+                        pass
+                    driver = create_driver()
                 continue
 
             if not record["店舗名"]:
@@ -409,7 +426,10 @@ def main():
         dataframe.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
         print(f"{OUTPUT_FILE} に {len(dataframe)} 件保存しました")
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except WebDriverException:
+            pass
 
 
 if __name__ == "__main__":
