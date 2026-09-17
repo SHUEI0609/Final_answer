@@ -255,7 +255,9 @@ def extract_email(driver):
         if "お店に直接メールする" not in link_text:
             continue
         href = unquote(link.get_attribute("href"))
-        return href.removeprefix("mailto:").split("?", 1)[0].strip()
+        if href.startswith("mailto:"):
+            href = href[len("mailto:") :]
+        return href.split("?", 1)[0].strip()
     return ""
 
 
