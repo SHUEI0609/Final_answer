@@ -34,6 +34,22 @@ COLUMNS = [
     "SSL",
 ]
 
+HOMEPAGE_LINK_LABELS = ("お店のホームページ", "オフィシャルページ")
+CAPTCHA_URL_MARKERS = (
+    "captcha",
+    "recaptcha",
+    "hcaptcha",
+    "cf-chl",
+    "/cdn-cgi/challenge-platform/",
+    "/sorry/",
+    "challenge-form",
+    "bot-check",
+    "bot_check",
+    "access-denied",
+    "access_denied",
+)
+INTERMEDIATE_HOST_SUFFIXES = ("gnavi.co.jp", "gnst.jp", "gurunavi.com")
+
 DATABASE_TYPES = {
     "店舗名": Text(),
     "電話番号": String(30),
@@ -143,13 +159,14 @@ def collect_shop_urls(session):
 
 
 def find_table_value(soup, label):
-    heading = soup.find(["th", "dt"], string=lambda value: value and label in value)
-    if heading is None:
-        return None
-
-    if heading.name == "th":
-        return heading.find_next_sibling("td")
-    return heading.find_next_sibling("dd")
+    for heading in soup.find_all(["th", "dt"]):
+        heading_text = re.sub(r"\s+", "", heading.get_text(" ", strip=True))
+        if label not in heading_text:
+            continue
+        if heading.name == "th":
+            return heading.find_next_sibling("td")
+        return heading.find_next_sibling("dd")
+    return None
 
 
 def get_restaurant_data(soup):
@@ -192,25 +209,22 @@ def split_address(address):
 
 
 def extract_email(soup):
-    email_link = soup.select_one('a[href^="mailto:"]')
-    if email_link is None:
-        return ""
+    for email_link in soup.select('a[href^="mailto:"]'):
+        link_text = re.sub(r"\s+", "", email_link.get_text(" ", strip=True))
+        if "お店に直接メールする" not in link_text:
+            continue
+        href = unquote(email_link.get("href", ""))
+        if href.startswith("mailto:"):
+            href = href[len("mailto:") :]
+        return href.split("?", 1)[0].strip()
+    return ""
 
-    href = unquote(email_link.get("href", ""))
-    if href.startswith("mailto:"):
-        href = href[len("mailto:") :]
-    return href.split("?", 1)[0].strip()
 
-
-def extract_official_url(soup):
-    homepage_cell = find_table_value(soup, "お店のホームページ")
-    if homepage_cell is None:
-        return ""
-
-    link = homepage_cell.select_one("a[data-o]")
-    if link is not None:
+def get_link_destination(link):
+    encoded_value = link.get("data-o")
+    if encoded_value:
         try:
-            encoded = json.loads(link["data-o"])
+            encoded = json.loads(encoded_value)
             scheme = encoded.get("b", "https")
             destination = encoded.get("a", "")
             if destination:
@@ -220,8 +234,43 @@ def extract_official_url(soup):
         except (json.JSONDecodeError, TypeError):
             pass
 
-    link = homepage_cell.select_one('a[href]:not([href="#"])')
-    return urljoin(SEARCH_URL, link["href"]) if link else ""
+    href = link.get("href", "")
+    if not href or href == "#":
+        return ""
+    return urljoin(SEARCH_URL, href)
+
+
+def extract_official_url(soup):
+    links = soup.select("a")
+    for label in HOMEPAGE_LINK_LABELS:
+        for link in links:
+            link_text = re.sub(r"\s+", "", link.get_text(" ", strip=True))
+            title = re.sub(r"\s+", "", link.get("title", ""))
+            if label not in link_text and label not in title:
+                continue
+            destination = get_link_destination(link)
+            if destination:
+                return destination
+    return ""
+
+
+def is_unusable_redirect(original_url, final_url):
+    parsed_original = urlparse(original_url)
+    parsed_final = urlparse(final_url)
+    final_host = (parsed_final.hostname or "").lower()
+    original_host = (parsed_original.hostname or "").lower()
+    final_value = f"{final_host}{parsed_final.path}?{parsed_final.query}".lower()
+
+    if not final_host:
+        return True
+    if any(marker in final_value for marker in CAPTCHA_URL_MARKERS):
+        return True
+
+    is_intermediate = any(
+        final_host == suffix or final_host.endswith(f".{suffix}")
+        for suffix in INTERMEDIATE_HOST_SUFFIXES
+    )
+    return is_intermediate and final_host != original_host
 
 
 def resolve_official_url(session, url):
@@ -231,8 +280,10 @@ def resolve_official_url(session, url):
     try:
         response = get_with_delay(session, url, allow_redirects=True, stream=True)
         final_url = response.url
-        has_ssl = urlparse(final_url).scheme == "https"
         response.close()
+        if is_unusable_redirect(url, final_url):
+            return url, urlparse(url).scheme == "https"
+        has_ssl = urlparse(final_url).scheme == "https"
         return final_url, has_ssl
     except requests.exceptions.SSLError:
         return url, False
@@ -273,7 +324,7 @@ def scrape_shop(session, shop_url):
 
     if not name:
         name_cell = find_table_value(soup, "店名")
-        name = name_cell.get_text(" ", strip=True) if name_cell else ""
+        name = next(name_cell.stripped_strings, "") if name_cell else ""
     if not telephone:
         phone_cell = find_table_value(soup, "電話番号")
         phone_text = phone_cell.get_text(" ", strip=True) if phone_cell else ""

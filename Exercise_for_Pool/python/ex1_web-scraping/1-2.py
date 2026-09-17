@@ -41,6 +41,22 @@ COLUMNS = [
     "SSL",
 ]
 
+HOMEPAGE_LINK_LABELS = ("お店のホームページ", "オフィシャルページ")
+CAPTCHA_URL_MARKERS = (
+    "captcha",
+    "recaptcha",
+    "hcaptcha",
+    "cf-chl",
+    "/cdn-cgi/challenge-platform/",
+    "/sorry/",
+    "challenge-form",
+    "bot-check",
+    "bot_check",
+    "access-denied",
+    "access_denied",
+)
+INTERMEDIATE_HOST_SUFFIXES = ("gnavi.co.jp", "gnst.jp", "gurunavi.com")
+
 PREFECTURE_PATTERN = r"北海道|東京都|京都府|大阪府|.{2,3}県"
 ADDRESS_PATTERN = re.compile(
     rf"^(?P<prefecture>{PREFECTURE_PATTERN})"
@@ -174,11 +190,17 @@ def collect_shop_urls(driver):
 
 
 def find_table_value(driver, label):
-    elements = driver.find_elements(
-        By.XPATH,
-        f"//th[contains(normalize-space(.), '{label}')]/following-sibling::td[1]",
-    )
-    return elements[0] if elements else None
+    for heading in driver.find_elements(By.CSS_SELECTOR, "th, dt"):
+        heading_text = re.sub(r"\s+", "", heading.text)
+        if label not in heading_text:
+            continue
+        values = heading.find_elements(
+            By.XPATH,
+            "following-sibling::*[self::td or self::dd][1]",
+        )
+        if values:
+            return values[0]
+    return None
 
 
 def get_restaurant_data(driver):
@@ -221,23 +243,20 @@ def split_address(address):
 
 
 def extract_email(driver):
-    links = driver.find_elements(By.CSS_SELECTOR, 'a[href^="mailto:"]')
-    if not links:
-        return ""
+    for link in driver.find_elements(By.CSS_SELECTOR, 'a[href^="mailto:"]'):
+        link_text = re.sub(r"\s+", "", link.text)
+        if "お店に直接メールする" not in link_text:
+            continue
+        href = unquote(link.get_attribute("href"))
+        return href.removeprefix("mailto:").split("?", 1)[0].strip()
+    return ""
 
-    href = unquote(links[0].get_attribute("href"))
-    return href.removeprefix("mailto:").split("?", 1)[0].strip()
 
-
-def extract_official_url(driver):
-    homepage_cell = find_table_value(driver, "お店のホームページ")
-    if homepage_cell is None:
-        return ""
-
-    links = homepage_cell.find_elements(By.CSS_SELECTOR, "a[data-o]")
-    if links:
+def get_link_destination(link):
+    encoded_value = link.get_attribute("data-o")
+    if encoded_value:
         try:
-            encoded = json.loads(links[0].get_attribute("data-o"))
+            encoded = json.loads(encoded_value)
             scheme = encoded.get("b", "https")
             destination = encoded.get("a", "")
             if destination:
@@ -247,12 +266,43 @@ def extract_official_url(driver):
         except (json.JSONDecodeError, TypeError):
             pass
 
-    for link in homepage_cell.find_elements(By.CSS_SELECTOR, "a[href]"):
-        href = link.get_attribute("href")
-        if href and not href.endswith("#"):
-            return href
+    href = link.get_attribute("href") or ""
+    if not href or href.endswith("#"):
+        return ""
+    return href
 
+
+def extract_official_url(driver):
+    links = driver.find_elements(By.CSS_SELECTOR, "a")
+    for label in HOMEPAGE_LINK_LABELS:
+        for link in links:
+            link_text = re.sub(r"\s+", "", link.text)
+            title = re.sub(r"\s+", "", link.get_attribute("title") or "")
+            if label not in link_text and label not in title:
+                continue
+            destination = get_link_destination(link)
+            if destination:
+                return destination
     return ""
+
+
+def is_unusable_redirect(original_url, final_url):
+    parsed_original = urlparse(original_url)
+    parsed_final = urlparse(final_url)
+    final_host = (parsed_final.hostname or "").lower()
+    original_host = (parsed_original.hostname or "").lower()
+    final_value = f"{final_host}{parsed_final.path}?{parsed_final.query}".lower()
+
+    if not final_host:
+        return True
+    if any(marker in final_value for marker in CAPTCHA_URL_MARKERS):
+        return True
+
+    is_intermediate = any(
+        final_host == suffix or final_host.endswith(f".{suffix}")
+        for suffix in INTERMEDIATE_HOST_SUFFIXES
+    )
+    return is_intermediate and final_host != original_host
 
 
 def resolve_official_url(driver, url):
@@ -263,6 +313,8 @@ def resolve_official_url(driver, url):
         open_after_wait(driver, url)
         final_url = driver.current_url
         is_secure_context = driver.execute_script("return window.isSecureContext")
+        if is_unusable_redirect(url, final_url):
+            return url, urlparse(url).scheme == "https"
         has_ssl = urlparse(final_url).scheme == "https" and is_secure_context
         return final_url, bool(has_ssl)
     except WebDriverException as error:
