@@ -14,6 +14,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip==24.3.1
 RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 CMD ["tail", "-f", "/dev/null"]
