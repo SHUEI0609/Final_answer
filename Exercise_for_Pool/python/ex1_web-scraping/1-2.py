@@ -322,10 +322,16 @@ def resolve_official_url(driver, url):
         open_after_wait(driver, url)
         final_url = driver.current_url
         is_secure_context = driver.execute_script("return window.isSecureContext")
+
         if is_unusable_redirect(url, final_url):
-            return url, urlparse(url).scheme == "https"
-        has_ssl = urlparse(final_url).scheme == "https" and is_secure_context
-        return final_url, bool(has_ssl)
+            saved_url = url
+        else:
+            saved_url = final_url
+
+        has_ssl = (
+            urlparse(saved_url).scheme == "https" and bool(is_secure_context)
+        )
+        return saved_url, has_ssl
     except WebDriverException as error:
         print(f"  公式サイトを確認できませんでした: {error.msg.splitlines()[0]}")
         return url, False
