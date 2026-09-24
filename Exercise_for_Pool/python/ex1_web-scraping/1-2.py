@@ -1,5 +1,7 @@
 import json
 import re
+import socket
+import ssl
 import time
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
@@ -314,6 +316,22 @@ def is_unusable_redirect(original_url, final_url):
     return is_intermediate and final_host != original_host
 
 
+def verify_saved_url_ssl(url):
+    """保存URLのホスト名・証明書チェーンを検証する。HTTP転送は追わない。"""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection(
+            (parsed.hostname, parsed.port or 443), timeout=PAGE_TIMEOUT
+        ) as connection:
+            with context.wrap_socket(connection, server_hostname=parsed.hostname):
+                return True
+    except (OSError, ValueError):
+        return False
+
+
 def resolve_official_url(driver, url):
     if not url:
         return "", ""
@@ -321,17 +339,13 @@ def resolve_official_url(driver, url):
     try:
         open_after_wait(driver, url)
         final_url = driver.current_url
-        is_secure_context = driver.execute_script("return window.isSecureContext")
 
         if is_unusable_redirect(url, final_url):
             saved_url = url
         else:
             saved_url = final_url
 
-        has_ssl = (
-            urlparse(saved_url).scheme == "https" and bool(is_secure_context)
-        )
-        return saved_url, has_ssl
+        return saved_url, verify_saved_url_ssl(saved_url)
     except WebDriverException as error:
         print(f"  公式サイトを確認できませんでした: {error.msg.splitlines()[0]}")
         return url, False
