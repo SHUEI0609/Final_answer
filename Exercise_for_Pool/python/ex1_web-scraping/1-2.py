@@ -317,7 +317,6 @@ def is_unusable_redirect(original_url, final_url):
 
 
 def verify_saved_url_ssl(url):
-    """保存URLのホスト名・証明書チェーンを検証する。HTTP転送は追わない。"""
     parsed = urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname:
         return False
